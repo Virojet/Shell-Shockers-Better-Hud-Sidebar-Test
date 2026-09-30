@@ -648,7 +648,9 @@ window.__ssbSettings = window.__ssbSettings || (function () {
            higher than 5.5em from the top: on a tall screen 60px + 1em is less than
            that, and the menu covered the team scores. Pure CSS: applies to the
            elements whenever the game creates them, present or future, no
-           observer or polling needed. */
+           observer or polling needed. That floor still mixes px with the game's
+           vh-based em, so the "Pause menu placement" module measures the menu
+           against the top HUD and slides it clear at any resolution. */
         try {
             var hideHouseAdCSS = document.createElement("style");
             hideHouseAdCSS.id = "ssb-hide-house-ad";
@@ -4977,6 +4979,136 @@ window.__ssbSettings = window.__ssbSettings || (function () {
     else boot();
 })();
 
+
+
+/* =======================================================================
+ *  BETTER HUD — Pause menu placement  (add-on module)
+ *  -----------------------------------------------------------------------
+ *  The pause menu's CSS offset (see "ssb-hide-house-ad") mixes a fixed 60px
+ *  with the game's vh-based em, so where the menu lands next to the top HUD
+ *  changes with resolution: on some screens it covered the team scores, the
+ *  capture/spatula status or the scoreboard.
+ *  Fix: whenever the menu is visible, measure it against the top HUD that is
+ *  actually on screen and slide it down just far enough to clear whatever it
+ *  overlaps horizontally, never so far that PLAY leaves the screen. The shift
+ *  uses the separate `translate` property, which stacks on top of any
+ *  transform or top the game sets, so the game's own layout stays untouched.
+ *  Event driven (resize, pointer lock, element size changes) plus the shared
+ *  menu poll as a fallback; nothing runs while you are playing.
+ * ===================================================================== */
+(function () {
+    "use strict";
+
+    const MENU_SEL = ".pause-container";
+    const SHIFT_VAR = "--ssb-pause-shift";
+    // Top-of-screen HUD the menu must not cover. Hidden ones (Hide Game Stats,
+    // Hide Scoreboard) measure as zero and are skipped.
+    const HUD_SEL = "#teamScores, #captureContainer, #captureIconContainer, #spatulaPlayer, .match-vs, .team-vs, .team-score, #playerList, #shellStreakContainer";
+    const GAP_EM = 0.6;        // space between the HUD and the menu
+    const BOTTOM_EM = 1;       // space kept below PLAY
+    const TOP_ZONE = 0.4;      // only HUD starting in the top 40% of the screen counts
+
+    let shift = 0, frame = null, ro = null, watched = [];
+    const nativeFrame = window.__ssbNativeFrame;
+
+    function ensureStyle() {
+        if (document.getElementById("ssb-pause-place-style")) return;
+        const el = document.createElement("style");
+        el.id = "ssb-pause-place-style";
+        el.textContent = MENU_SEL + " { translate: 0 var(" + SHIFT_VAR + ", 0px); }";
+        (document.head || document.documentElement).appendChild(el);
+    }
+
+    function visibleRect(el) {
+        if (!el.getClientRects().length) return null;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return null;
+        const cs = getComputedStyle(el);
+        if (cs.visibility === "hidden" || parseFloat(cs.opacity) < 0.05) return null;
+        return r;
+    }
+
+    // The menu's painted extent: the union of its visible panels. Full-height
+    // wrappers are looked through so they don't count as the menu's size.
+    function menuBox(menu, vh) {
+        let top = Infinity, bottom = -Infinity, left = Infinity, right = -Infinity;
+        (function walk(el, depth) {
+            for (const c of el.children) {
+                const r = visibleRect(c);
+                if (!r) continue;
+                if (r.height > vh * 0.95) { if (depth < 3) walk(c, depth + 1); continue; }
+                top = Math.min(top, r.top); bottom = Math.max(bottom, r.bottom);
+                left = Math.min(left, r.left); right = Math.max(right, r.right);
+            }
+        })(menu, 0);
+        return top < bottom ? { top, bottom, left, right } : null;
+    }
+
+    function setShift(px) {
+        if (Math.abs(px - shift) < 1) return;
+        shift = px;
+        document.documentElement.style.setProperty(SHIFT_VAR, px + "px");
+    }
+
+    function place() {
+        frame = null;
+        if (document.hidden || document.pointerLockElement) return;
+        const menu = document.querySelector(MENU_SEL);
+        const vh = document.documentElement.clientHeight || window.innerHeight;
+        const box = menu && visibleRect(menu) && menuBox(menu, vh);
+        if (!box) return;                                    // menu closed: keep the last shift
+        const em = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+        // Where the menu sits with no shift applied.
+        const natTop = box.top - shift, natBottom = box.bottom - shift;
+        let clearTo = -Infinity;
+        document.querySelectorAll(HUD_SEL).forEach(el => {
+            if (menu.contains(el) || el.contains(menu)) return;
+            const r = visibleRect(el);
+            if (!r || r.top > vh * TOP_ZONE) return;
+            if (r.right <= box.left || r.left >= box.right) return;   // no horizontal overlap
+            clearTo = Math.max(clearTo, r.bottom + GAP_EM * em);
+        });
+        const want = Math.max(0, clearTo - natTop);
+        const room = Math.max(0, vh - BOTTOM_EM * em - natBottom);   // PLAY stays on screen
+        setShift(Math.round(Math.min(want, room)));
+        watch(menu);
+    }
+
+    function request() {
+        if (frame !== null || document.hidden || document.pointerLockElement) return;
+        frame = nativeFrame.request(place);
+    }
+
+    // Re-place when the menu or any HUD piece changes size (pinned stats added,
+    // scores growing a digit, a mode's capture bar appearing).
+    function watch(menu) {
+        if (!window.ResizeObserver) return;
+        const els = [menu, ...document.querySelectorAll(HUD_SEL)];
+        if (els.length === watched.length && els.every((el, n) => el === watched[n])) return;
+        if (ro) ro.disconnect();
+        ro = new ResizeObserver(request);
+        els.forEach(el => ro.observe(el));
+        watched = els;
+    }
+
+    function boot() {
+        ensureStyle();
+        window.addEventListener("resize", request);
+        document.addEventListener("fullscreenchange", request);
+        document.addEventListener("visibilitychange", request);
+        document.addEventListener("ssb:settings-change", request);
+        // The game fills the menu in after pointer lock is released.
+        document.addEventListener("pointerlockchange", () => {
+            if (document.pointerLockElement) return;
+            request(); setTimeout(request, 150);
+        });
+        if (document.fonts) document.fonts.ready.then(request);
+        window.__ssbMenuPoll(request, 1000);
+        request();
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+    else boot();
+})();
 
 
 /* =======================================================================
